@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty Koharu\\main.py'],
+    ['C:\\Users\\Beatlxss\\Desktop\\projects\\yt-dlp-integration-Koharu-Edition\\yt-dlp-integration-Koharu-Edition\\main.py'],
     pathex=[],
-    binaries=[('C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty Koharu\\vendor\\ffmpeg.exe', '.'), ('C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty Koharu\\vendor\\ffprobe.exe', '.')],
-    datas=[('C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty Koharu\\vendor\\app.ico', '.'), ('C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty Koharu\\vendor\\blue-archive-koharu.gif', 'vendor')],
+    binaries=[('C:\\Users\\Beatlxss\\Desktop\\projects\\yt-dlp-integration-Koharu-Edition\\yt-dlp-integration-Koharu-Edition\\vendor\\ffmpeg.exe', '.'), ('C:\\Users\\Beatlxss\\Desktop\\projects\\yt-dlp-integration-Koharu-Edition\\yt-dlp-integration-Koharu-Edition\\vendor\\ffprobe.exe', '.')],
+    datas=[('C:\\Users\\Beatlxss\\Desktop\\projects\\yt-dlp-integration-Koharu-Edition\\yt-dlp-integration-Koharu-Edition\\vendor\\app.ico', '.'), ('C:\\Users\\Beatlxss\\Desktop\\projects\\yt-dlp-integration-Koharu-Edition\\yt-dlp-integration-Koharu-Edition\\vendor\\blue-archive-koharu.gif', 'vendor')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -32,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty Koharu\\vendor\\app.ico'],
+    icon=['C:\\Users\\Beatlxss\\Desktop\\projects\\yt-dlp-integration-Koharu-Edition\\yt-dlp-integration-Koharu-Edition\\vendor\\app.ico'],
 )
 coll = COLLECT(
     exe,
