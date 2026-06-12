@@ -1,0 +1,52 @@
+Video & Music Downloader — Features
+
+(Generated from onefile/main.py + onefile/README.md)
+
+Core
+- Windows executable wrapper around yt-dlp with bundled FFmpeg for merge/convert
+- Two ways to run:
+  - Tray mode (double-click / no CLI args)
+  - CLI mode (forwards arguments to yt-dlp)
+
+Tray mode (Windows system tray)
+- Runs without a main window; uses a tray icon + right-click menu
+- Uses the clipboard URL as the download target (only acts if clipboard contains an http/https URL)
+- Quick actions:
+  - Video download at 720p / 1080p / 1440p / 4K (2160p)
+  - Audio (music) download as MP3 at 128 / 192 / 256 / 320 kbps
+- Playlist actions:
+  - Download playlists (video or audio) with the same quality presets
+  - Cancel an in-progress playlist download
+  - Shows playlist progress in the tray tooltip (item index / total)
+- Autostart toggle (adds/removes the app from Windows startup via HKCU\...\Run)
+
+Download behavior
+- Default download location: the user’s Windows “Downloads” known folder (with fallback to ~/Downloads)
+- Video mode:
+  - Selects best video+audio up to the chosen height and merges into MP4
+  - If the chosen resolution is not available, falls back to “Best” automatically
+- Music mode:
+  - Downloads best available audio (optionally capped by bitrate)
+  - Converts/extracts to MP3 via FFmpeg
+
+FFmpeg integration
+- Automatically finds FFmpeg when bundled:
+  - PyInstaller onefile extraction directory (_MEIPASS)
+  - Executable directory / _internal folder (onedir layout)
+  - Dev fallback: onefile/vendor/
+- `--ffmpeg-dir` option to point to a custom FFmpeg folder (overrides bundled copy)
+- Adds the resolved FFmpeg folder to PATH so yt-dlp can invoke ffmpeg/ffprobe
+- Health checks for missing ffmpeg.exe / ffprobe.exe
+- Best-effort detection of missing FFmpeg DLLs (shared builds) without launching ffmpeg.exe
+
+CLI mode (yt-dlp passthrough)
+- Any additional arguments are passed directly to yt-dlp
+- Supports calling either:
+  - `ytdlp-onefile -- <yt-dlp args>`
+  - `ytdlp-onefile <yt-dlp args>` (no `--` needed)
+- If no yt-dlp output path is provided, the working directory is set to Downloads by default
+
+Logging & crash handling
+- Appends basic operational logs to %TEMP%\ytdlp-onefile.log
+- Writes crash logs to %TEMP%\ytdlp-onefile.log on tray startup failures
+- On playlist cancel, attempts to clean up partial/temp files (.part/.tmp/.ytdl/etc.) while keeping completed .mp3/.mp4

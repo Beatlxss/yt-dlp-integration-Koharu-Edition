@@ -1,0 +1,10 @@
+{
+    "chat.mcp.serverSampling": {
+        "browser-extension/.vscode/mcp.json: io.github.ChromeDevTools/chrome-devtools-mcp": {
+            "allowedModels": [
+                "copilotcli/gpt-5.3-codex",
+                "copilot/gpt-5.3-codex"
+            ]
+        }
+    }
+}

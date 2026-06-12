@@ -1,0 +1,19 @@
+Video & Music Downloader
+
+What you can do
+- Download videos in: 720p, 1080p, 1440p, or 4K
+- Download music as MP3 in: 128, 192, 256, or 320 kbps
+- Download single videos OR whole playlists
+- Cancel a playlist download if you started the wrong one
+
+How it works (simple)
+- Copy a video/playlist link
+- Click the app icon in your system tray (near the clock)
+- Choose Video / Audio (or Playlist) and pick the quality
+
+Where files go
+- Saves downloads to your Windows “Downloads” folder by default
+
+Extra
+- Optional “Autostart” toggle so it can start with Windows
+- Advanced users can run it with command-line options too

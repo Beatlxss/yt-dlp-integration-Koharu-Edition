@@ -1,0 +1,64 @@
+('C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+ 'Koharu\\build\\ytdlp-onefile\\ytdlp-onefile.pkg',
+ {'BINARY': True,
+  'DATA': True,
+  'EXECUTABLE': True,
+  'EXTENSION': True,
+  'PYMODULE': True,
+  'PYSOURCE': True,
+  'PYZ': False,
+  'SPLASH': True,
+  'SYMLINK': False},
+ [('pyi-contents-directory _internal', '', 'OPTION'),
+  ('PYZ-00.pyz',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\build\\ytdlp-onefile\\PYZ-00.pyz',
+   'PYZ'),
+  ('struct',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\build\\ytdlp-onefile\\localpycs\\struct.pyc',
+   'PYMODULE'),
+  ('pyimod01_archive',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\build\\ytdlp-onefile\\localpycs\\pyimod01_archive.pyc',
+   'PYMODULE'),
+  ('pyimod02_importers',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\build\\ytdlp-onefile\\localpycs\\pyimod02_importers.pyc',
+   'PYMODULE'),
+  ('pyimod03_ctypes',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\build\\ytdlp-onefile\\localpycs\\pyimod03_ctypes.pyc',
+   'PYMODULE'),
+  ('pyimod04_pywin32',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\build\\ytdlp-onefile\\localpycs\\pyimod04_pywin32.pyc',
+   'PYMODULE'),
+  ('pyiboot01_bootstrap',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\.venv\\lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
+   'PYSOURCE'),
+  ('pyi_rth_pyqt6',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_pyqt6.py',
+   'PYSOURCE'),
+  ('pyi_rth_pkgutil',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_pkgutil.py',
+   'PYSOURCE'),
+  ('main',
+   'C:\\Users\\Beatlxss\\Desktop\\projects\\Video & music downloader\\Naughty '
+   'Koharu\\main.py',
+   'PYSOURCE')],
+ 'python310.dll',
+ True,
+ False,
+ False,
+ [],
+ None,
+ None,
+ None)
