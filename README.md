@@ -19,6 +19,7 @@
 
 - Autostart
 - Button to update yt-dlp.exe or manually change version via explorer where app is installed
+- Everything is coded with AI
 
 ## Extensions
 
