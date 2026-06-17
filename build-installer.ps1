@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.3.0",
+    [string]$Version,
     [ValidateSet("onedir")][string]$Mode = "onedir",
     [switch]$BuildFirst
 )
@@ -54,6 +54,19 @@ if (-not $Iscc) {
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $Root "dist-installer") | Out-Null
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = Read-Host "Enter app version (example: 1.3.1)"
+}
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    throw "Version is required. Pass -Version or enter it in the console prompt."
+}
+
+$Version = $Version.Trim()
+if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+    throw "Invalid version '$Version'. Use format like 1.3.1 or 1.3.1-beta.1"
+}
 
 & $Iscc "/DMyAppVersion=$Version" $Iss
 
