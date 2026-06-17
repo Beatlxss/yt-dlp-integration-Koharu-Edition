@@ -1,7 +1,0 @@
-/dist/
-/dist-installer/
-/build/
-/.venv/
-ytdlp-onefile.spec
-.gitignore
-.gitattributes
