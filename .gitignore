@@ -3,3 +3,7 @@
 /build/
 /.venv/
 ytdlp-onefile.spec
+/installer/
+/vendor/
+build-installer.ps1
+build.ps1
