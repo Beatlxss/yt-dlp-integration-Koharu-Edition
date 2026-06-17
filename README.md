@@ -24,3 +24,4 @@
 ## Extensions
 
 - youtube/youtube music, twitter/x, reddit, tiktok (WIP)
+- every has independent download button
