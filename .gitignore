@@ -1,0 +1,6 @@
+/dist/
+/dist-installer/
+/build/
+/.venv/
+ytdlp-onefile.spec
+/browser-extension/.vscode/
