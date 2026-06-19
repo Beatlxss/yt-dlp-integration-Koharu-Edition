@@ -1,3 +1,7 @@
+## What it is
+
+It's an tray system app with pop-up meniu selectable between MP3/MP4 and quality combined with yt-dlp
+
 ## What you can do
 
 - Download videos in: 720p, 1080p, 1440p, 2560p
