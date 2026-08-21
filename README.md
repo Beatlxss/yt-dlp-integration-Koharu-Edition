@@ -25,6 +25,14 @@ It's an tray system app with pop-up meniu selectable between MP3/MP4 and quality
 - Button to update yt-dlp.exe or manually change version via explorer where app is installed
 - Everything is coded with AI
 
+## Logging
+
+Application logs are written to `%TEMP%\\ytdlp-onefile.log` using searchable, timestamped entries with components and download operation IDs.
+
+- `LOG_LEVEL=INFO` is the default for normal operation.
+- Set `LOG_LEVEL=DEBUG` before starting the app to include yt-dlp output and detailed HTTP/Qt diagnostics.
+- Available levels are `DEBUG`, `INFO`, `WARN`, and `ERROR`.
+
 ## Extensions
 
 - youtube/youtube music, twitter/x, reddit, tiktok (WIP)

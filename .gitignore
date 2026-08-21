@@ -4,3 +4,6 @@
 /.venv/
 ytdlp-onefile.spec
 /browser-extension/.vscode/
+.github
+/vendor/ffmpeg.exe
+/vendor/ffprobe.exe

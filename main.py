@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import winreg
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
@@ -93,6 +94,163 @@ _YTDLP_VERSION_CACHE_LOCK = threading.Lock()
 _YTDLP_VERSION_CACHE_VALUE: Optional[str] = None
 _YTDLP_VERSION_CACHE_TS: float = 0.0
 _YTDLP_VERSION_REFRESHING = False
+
+_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+_LOG_WRITE_LOCK = threading.Lock()
+_ANSI_COLOR_CHECKED: set[int] = set()
+_DOWNLOAD_ID_LOCK = threading.Lock()
+_DOWNLOAD_ID_SEQUENCE = 0
+_SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "auth",
+    "authorization",
+    "cookie",
+    "key",
+    "password",
+    "session",
+    "signature",
+    "token",
+}
+_URL_IN_LOG_TEXT_RE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
+
+
+def _minimum_log_level() -> int:
+    value = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    return _LOG_LEVELS.get(value, _LOG_LEVELS["INFO"])
+
+
+def _next_download_id() -> str:
+    global _DOWNLOAD_ID_SEQUENCE
+    with _DOWNLOAD_ID_LOCK:
+        _DOWNLOAD_ID_SEQUENCE += 1
+        return f"DL-{_DOWNLOAD_ID_SEQUENCE:04d}"
+
+
+def _sanitize_log_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if not parsed.scheme or not parsed.netloc:
+            return value
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        safe_query = []
+        for key, item in query:
+            normalized_key = key.lower()
+            is_sensitive = normalized_key in _SENSITIVE_QUERY_KEYS or any(
+                marker in normalized_key
+                for marker in ("token", "secret", "password", "authorization", "cookie", "signature", "session")
+            )
+            safe_query.append((key, "<redacted>" if is_sensitive else item))
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(safe_query), "")
+        )
+    except Exception:
+        return value
+
+
+def _sanitize_urls_in_log_text(value: str) -> str:
+    return _URL_IN_LOG_TEXT_RE.sub(lambda match: _sanitize_log_url(match.group(0)), value)
+
+
+def _format_log_value(value: Any, key: str = "") -> str:
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    if key.lower() in {"url", "uri", "source"}:
+        text = _sanitize_log_url(text)
+    else:
+        text = _sanitize_urls_in_log_text(text)
+    if not text:
+        return '""'
+    if any(char.isspace() for char in text) or '"' in text:
+        return json.dumps(text, ensure_ascii=False)
+    return text
+
+
+def _console_supports_color(stream: Any) -> bool:
+    if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", lambda: False)():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        fd = stream.fileno()
+        if fd in _ANSI_COLOR_CHECKED:
+            return True
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11 if stream is sys.stdout else -12)
+        mode = ctypes.c_uint()
+        if not handle or not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if not kernel32.SetConsoleMode(handle, mode.value | 0x0004):
+            return False
+        _ANSI_COLOR_CHECKED.add(fd)
+        return True
+    except Exception:
+        return False
+
+
+def _log_separator(blank_line: bool = False) -> None:
+    """Write a visual separator without treating it as an application event."""
+    line = "" if blank_line else "-" * 60
+    with _LOG_WRITE_LOCK:
+        try:
+            log_path = Path(os.environ.get("TEMP", str(Path.home()))) / "ytdlp-onefile.log"
+            with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
+                log_file.write(line + "\n")
+        except Exception:
+            pass
+
+        try:
+            stream = sys.stdout
+            if getattr(stream, "isatty", lambda: False)():
+                print(line, file=stream, flush=True)
+        except Exception:
+            pass
+
+
+def _log(
+    level: str,
+    component: str,
+    message: str,
+    operation_id: Optional[str] = None,
+    **fields: Any,
+) -> None:
+    """Write one searchable application log entry to the shared log and console."""
+    level = level.upper()
+    if level not in _LOG_LEVELS:
+        level = "ERROR"
+    if _LOG_LEVELS[level] < _minimum_log_level():
+        return
+
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    component = component.upper()[:8]
+    operation = operation_id or "-"
+    entry = f"[{timestamp}] [{level:<5}] [{component:<8}] [{operation:<7}] {_sanitize_urls_in_log_text(str(message))}"
+    if fields:
+        entry += " " + " ".join(
+            f"{key}={_format_log_value(value, key)}"
+            for key, value in fields.items()
+            if value is not None
+        )
+
+    with _LOG_WRITE_LOCK:
+        try:
+            log_path = Path(os.environ.get("TEMP", str(Path.home()))) / "ytdlp-onefile.log"
+            with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
+                log_file.write(entry + "\n")
+        except Exception:
+            pass
+
+        try:
+            stream = sys.stderr if level == "ERROR" else sys.stdout
+            if not getattr(stream, "isatty", lambda: False)():
+                return
+            colors = {"DEBUG": "\033[36m", "INFO": "\033[32m", "WARN": "\033[33m", "ERROR": "\033[31m"}
+            color = colors[level] if _console_supports_color(stream) else ""
+            reset = "\033[0m" if color else ""
+            print(f"{color}{entry}{reset}", file=stream, flush=True)
+        except Exception:
+            pass
 
 
 def _get_configured_download_dir() -> Optional[Path]:
@@ -407,29 +565,20 @@ def _maybe_autoupdate_ytdlp(check_every_seconds: int = 24 * 60 * 60) -> None:
 
     ytdlp_exe = _resolve_ytdlp_exe()
     if not ytdlp_exe or not ytdlp_exe.exists():
-        try:
-            _append_log_line("yt-dlp: update check skipped (yt-dlp.exe not found)")
-        except Exception:
-            pass
+        _log("DEBUG", "UPDATE", "Update check skipped", reason="ytdlp_not_found")
         return
 
     now = int(time.time())
     last = _get_reg_int(_REG_YTDLP_LAST_UPDATE_CHECK) or 0
     if last and (now - last) < int(check_every_seconds):
-        try:
-            mins = max(0, int((now - last) // 60))
-            _append_log_line(f"yt-dlp: update check skipped (checked {mins} min ago)")
-        except Exception:
-            pass
+        mins = max(0, int((now - last) // 60))
+        _log("DEBUG", "UPDATE", "Update check skipped", reason="recently_checked", age=f"{mins}m")
         return
 
     # Set timestamp first to avoid repeated spawns if the app is launched multiple times quickly.
     _set_reg_int(_REG_YTDLP_LAST_UPDATE_CHECK, now)
 
-    try:
-        _append_log_line(f"yt-dlp: update check scheduled ({ytdlp_exe})")
-    except Exception:
-        pass
+    _log("INFO", "UPDATE", "Update check scheduled")
 
     _start_ytdlp_update(force=True, reason="auto")
 
@@ -462,6 +611,9 @@ def _start_ytdlp_update(
             return False
         _YTDLP_UPDATING = True
 
+    if reason == "manual":
+        _log("INFO", "UPDATE", "Manual update requested")
+
     def worker() -> None:
         global _YTDLP_UPDATING
         success = False
@@ -469,7 +621,7 @@ def _start_ytdlp_update(
         try:
             with _YTDLP_LOCK:
                 cmd = [str(ytdlp_exe), "-U", "--no-warnings"]
-                _append_log_line(f"yt-dlp: update start ({reason})")
+                _log("INFO", "UPDATE", "Update check started", mode=reason)
                 kw = _subprocess_kwargs_no_window()
                 cp = subprocess.run(cmd, cwd=str(_effective_download_dir()), timeout=240, **kw)
                 out = (cp.stdout or "").strip()
@@ -477,10 +629,10 @@ def _start_ytdlp_update(
             if cp.returncode == 0:
                 success = True
                 msg = out.splitlines()[-1].strip() if out else "ok"
-                _append_log_line(f"yt-dlp: update ok: {msg}")
+                _log("INFO", "UPDATE", "Update completed", result=msg)
             else:
                 msg = out.splitlines()[-1].strip() if out else f"exit={cp.returncode}"
-                _append_log_line(f"yt-dlp: update failed: {msg}")
+                _log("ERROR", "UPDATE", "Update failed", result=msg)
 
             # Refresh cached version after update (best-effort).
             try:
@@ -494,7 +646,9 @@ def _start_ytdlp_update(
                 pass
         except Exception as exc:
             msg = str(exc)
-            _append_log_line(f"yt-dlp: update error: {exc}")
+            _log("ERROR", "UPDATE", "Update failed", error=exc)
+            if _minimum_log_level() <= _LOG_LEVELS["DEBUG"]:
+                _log("DEBUG", "UPDATE", "Traceback", traceback=traceback.format_exc())
         finally:
             with _YTDLP_UPDATE_STATE_LOCK:
                 _YTDLP_UPDATING = False
@@ -710,6 +864,7 @@ def _run_ytdlp_with_progress(
     extra_progress_hook=None,
     cancel_event: Optional[threading.Event] = None,
     remember_path_cb=None,
+    operation_id: Optional[str] = None,
 ) -> tuple[int, str]:
     output_lines: list[str] = []
 
@@ -723,6 +878,8 @@ def _run_ytdlp_with_progress(
     # Avoid running yt-dlp while it is self-updating.
     with _YTDLP_LOCK:
         proc = subprocess.Popen(cmd, cwd=str(cwd), **_subprocess_kwargs_no_window())
+        _log("DEBUG", "YTDLP", "Process started", operation_id, pid=proc.pid)
+        metadata_logged = False
 
         try:
             assert proc.stdout is not None
@@ -739,6 +896,10 @@ def _run_ytdlp_with_progress(
                     output_lines.append(line)
                     if len(output_lines) > 400:
                         output_lines = output_lines[-200:]
+                    _log("DEBUG", "YTDLP", line, operation_id)
+                    if not metadata_logged and "[info]" in line.lower():
+                        metadata_logged = True
+                        _log("DEBUG", "YTDLP", "Metadata extracted", operation_id)
 
                 try:
                     if remember_path_cb is not None:
@@ -1036,21 +1197,13 @@ def _start_best_video_download(url: str, ffmpeg_dir: Optional[Path]) -> None:
     url = (url or "").strip()
     if not url or not _URL_RE.match(url):
         return
+    operation_id = _next_download_id()
 
     def status_cb(msg: str) -> None:
-        try:
-            _append_log_line(f"auto: {msg}")
-        except Exception:
-            pass
+        return
 
     def done_cb(err: Optional[str]) -> None:
-        try:
-            if err:
-                _append_log_line(f"auto: failed: {err}")
-            else:
-                _append_log_line("auto: done")
-        except Exception:
-            pass
+        return
 
     threading.Thread(
         target=_download_with_ytdlp,
@@ -1065,6 +1218,7 @@ def _start_best_video_download(url: str, ffmpeg_dir: Optional[Path]) -> None:
             done_cb,
             None,
             None,
+            operation_id,
         ),
         daemon=True,
     ).start()
@@ -1160,7 +1314,7 @@ def _start_local_http_listener() -> None:
                                     ip = str(getattr(self, "client_address", ["?"])[0])
                                 except Exception:
                                     ip = "?"
-                                _append_log_line(f"http: ping from {ip} count={cnt}")
+                                _log("DEBUG", "HTTP", "Ping", client=ip, count=cnt)
                     except Exception:
                         pass
                     self._send(200, {"ok": True})
@@ -1181,10 +1335,11 @@ def _start_local_http_listener() -> None:
                     }
                     norm = _normalize_download_request(req)
                     if norm is None:
+                        _log("WARN", "HTTP", "Request rejected", path=parsed.path, reason="invalid_url")
                         self._send(400, {"ok": False, "error": "invalid url"})
                         return
                     _set_injected_url(str(norm.get("url") or ""))
-                    _append_log_line(f"http: download url: {norm.get('url')}")
+                    _log("DEBUG", "HTTP", "Download request", url=norm.get("url"))
                     started = _notify_local_http_download(norm)
                     self._send(200, {"ok": True, "started": started})
                     return
@@ -1196,7 +1351,7 @@ def _start_local_http_listener() -> None:
                     url = (qs.get("url") or [""])[0]
                     ok = _set_injected_url(url)
                     if ok:
-                        _append_log_line(f"http: injected url: {url}")
+                        _log("DEBUG", "HTTP", "URL injected", url=url)
                         started = _notify_local_http_url(url)
                         self._send(200, {"ok": True, "started": started})
                     else:
@@ -1242,9 +1397,9 @@ def _start_local_http_listener() -> None:
                 ok = _set_injected_url(url)
                 if ok:
                     if parsed.path == "/download":
-                        _append_log_line(f"http: download url: {url}")
+                        _log("DEBUG", "HTTP", "Download request", url=url)
                     else:
-                        _append_log_line(f"http: injected url: {url}")
+                        _log("DEBUG", "HTTP", "URL injected", url=url)
                     started = _notify_local_http_download({
                         "url": url,
                         "mode": obj.get("mode") if isinstance(obj, dict) else None,
@@ -1256,19 +1411,20 @@ def _start_local_http_listener() -> None:
                 else:
                     self._send(400, {"ok": False, "error": "invalid url"})
             except Exception as exc:
+                _log("ERROR", "HTTP", "Request failed", error=exc)
                 self._send(500, {"ok": False, "error": str(exc)})
 
     def worker() -> None:
         try:
             httpd = ThreadingHTTPServer(("127.0.0.1", 8791), Handler)
         except OSError as exc:
-            _append_log_line(f"http: listener not started: {exc}")
+            _log("ERROR", "HTTP", "Server failed to start", port=8791, error=exc)
             return
         try:
-            _append_log_line("http: listening on http://localhost:8791")
+            _log("INFO", "HTTP", "Server started", port=8791)
             httpd.serve_forever(poll_interval=0.5)
         except Exception as exc:
-            _append_log_line(f"http: listener stopped: {exc}")
+            _log("WARN", "HTTP", "Server stopped", error=exc)
         finally:
             try:
                 httpd.server_close()
@@ -1292,13 +1448,31 @@ def _clipboard_url() -> Optional[str]:
 
 
 def _append_log_line(line: str) -> None:
-    try:
-        log_path = Path(os.environ.get("TEMP", str(Path.home()))) / "ytdlp-onefile.log"
-        # Use append mode to avoid races between threads.
-        with log_path.open("a", encoding="utf-8", errors="replace") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    """Compatibility bridge for legacy callers while they are migrated to `_log`."""
+    text = str(line)
+    lower = text.lower()
+    component = "APP"
+    level = "INFO"
+    if lower.startswith(("qt:", "tray:", "tray-callback", "wnd ")):
+        component = "QT"
+        level = "DEBUG"
+    elif lower.startswith("http:"):
+        component = "HTTP"
+        level = "DEBUG" if "ping" in lower or "url:" in lower else "INFO"
+    elif lower.startswith("yt-dlp:"):
+        component = "UPDATE"
+    elif lower.startswith(("download-dir:", "autostart:", "progress-pos:")):
+        component = "CONFIG"
+    elif lower.startswith(("auto:", "playlist")):
+        component = "DOWNLOAD"
+        level = "DEBUG"
+    elif lower.startswith("open-log"):
+        component = "FILE"
+    if any(token in lower for token in (" failed", " error", "not started")):
+        level = "ERROR"
+    elif "cancel" in lower or "not available" in lower:
+        level = "WARN"
+    _log(level, component, text)
 
 
 def _is_autostart_enabled(app_name: str) -> bool:
@@ -1345,12 +1519,38 @@ def _download_with_ytdlp(
     done_cb,
     extra_progress_hook=None,
     cancel_event: Optional[threading.Event] = None,
+    operation_id: Optional[str] = None,
 ):
     class _Canceled(Exception):
         pass
 
+    operation_id = operation_id or _next_download_id()
+    started_at = time.monotonic()
     download_dir = _effective_download_dir()
     seen_paths: set[Path] = set()
+
+    def _platform() -> str:
+        try:
+            host = urllib.parse.urlsplit(url).hostname or "unknown"
+            return host.removeprefix("www.").split(".")[0].lower() or "unknown"
+        except Exception:
+            return "unknown"
+
+    def _failure_reason(detail: str) -> str:
+        low = detail.lower()
+        if "unsupported url" in low:
+            return "UNSUPPORTED_URL"
+        if "unexpected response" in low:
+            return "UNEXPECTED_RESPONSE"
+        if "requested format" in low or "format not available" in low:
+            return "FORMAT_UNAVAILABLE"
+        if "yt-dlp.exe not found" in low:
+            return "YTDLP_NOT_FOUND"
+        return "YTDLP_FAILED"
+
+    _log_separator(blank_line=True)
+    _log("INFO", "DOWNLOAD", "Started", operation_id, platform=_platform(), mode=mode, playlist=playlist)
+    _log("DEBUG", "DOWNLOAD", "URL", operation_id, url=url)
 
     def _remember_path(raw: Optional[str]) -> None:
         if not raw:
@@ -1402,6 +1602,7 @@ def _download_with_ytdlp(
     try:
         ytdlp_exe = _resolve_ytdlp_exe()
         if not ytdlp_exe or not ytdlp_exe.exists():
+            _log("ERROR", "DOWNLOAD", "Failed", operation_id, reason="YTDLP_NOT_FOUND")
             done_cb(
                 "yt-dlp.exe not found. Put yt-dlp.exe next to the app (or set YTDLP_EXE)."
             )
@@ -1445,6 +1646,7 @@ def _download_with_ytdlp(
                 extra_progress_hook=extra_progress_hook,
                 cancel_event=cancel_event,
                 remember_path_cb=_remember_path,
+                operation_id=operation_id,
             )
             if cancel_event is not None and cancel_event.is_set():
                 raise _Canceled("Canceled")
@@ -1477,6 +1679,8 @@ def _download_with_ytdlp(
                 cmd += ["--audio-quality", f"{audio_bitrate_kbps}K"]
             cmd += [url]
 
+            _log("DEBUG", "YTDLP", "Format selected", operation_id, selected="bestaudio")
+
             rc, out = run_cmd(cmd)
             if rc != 0:
                 low = (out or "").lower()
@@ -1494,6 +1698,7 @@ def _download_with_ytdlp(
             def run_video(format_sel: str) -> tuple[int, str]:
                 cmd = list(base_cmd)
                 cmd += ["-f", format_sel, "--merge-output-format", "mp4", url]
+                _log("DEBUG", "YTDLP", "Format selected", operation_id, selected=format_sel)
                 return run_cmd(cmd)
 
             if video_height:
@@ -1507,7 +1712,7 @@ def _download_with_ytdlp(
                         or "no video formats" in low
                     )
                     if is_format_issue:
-                        _append_log_line(f"{video_height}p not available; falling back to Best")
+                        _log("WARN", "DOWNLOAD", "Requested format unavailable; falling back", operation_id, requested=f"{video_height}p")
                         rc, out = run_video("bv*+ba/b")
                     if rc != 0:
                         raise RuntimeError(out.strip() or f"yt-dlp failed ({rc})")
@@ -1516,12 +1721,23 @@ def _download_with_ytdlp(
                 if rc != 0:
                     raise RuntimeError(out.strip() or f"yt-dlp failed ({rc})")
 
+        output_paths = sorted(str(path) for path in seen_paths)
+        if output_paths:
+            _log("INFO", "DOWNLOAD", "Completed", operation_id, file=output_paths[-1])
+        else:
+            _log("INFO", "DOWNLOAD", "Completed", operation_id)
+        _log("INFO", "DOWNLOAD", "Duration", operation_id, duration=f"{time.monotonic() - started_at:.2f}s")
         done_cb(None)
     except _Canceled as exc:
         if playlist:
             _cleanup_canceled_items()
+        _log("WARN", "DOWNLOAD", "Canceled", operation_id, duration=f"{time.monotonic() - started_at:.2f}s")
         done_cb(str(exc))
     except Exception as exc:
+        _log("ERROR", "DOWNLOAD", "Failed", operation_id, reason=_failure_reason(str(exc)), duration=f"{time.monotonic() - started_at:.2f}s")
+        _log("DEBUG", "DOWNLOAD", "Failure detail", operation_id, detail=str(exc))
+        if _minimum_log_level() <= _LOG_LEVELS["DEBUG"]:
+            _log("DEBUG", "DOWNLOAD", "Traceback", operation_id, traceback=traceback.format_exc())
         done_cb(str(exc))
 
 
@@ -1597,6 +1813,8 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
     # Right-click: show a menu.
     # Clipboard URL is used for actions; if clipboard doesn't contain a URL, do nothing (no popup).
     try:
+        _log_separator()
+        _log("INFO", "APP", "Application starting")
         # Fire-and-forget yt-dlp update check. (No UI, logs only.)
         _maybe_autoupdate_ytdlp()
         _schedule_ytdlp_version_refresh(force=True)
@@ -1606,10 +1824,10 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
 
         # Prefer PyQt tray/menu for a modern Windows-like UI.
         try:
-            _append_log_line("tray: trying PyQt")
+            _log("DEBUG", "QT", "Initializing PyQt system tray")
             return run_tray_qt(ffmpeg_dir=ffmpeg_dir)
         except Exception as exc:
-            _append_log_line(f"tray: PyQt failed: {exc}")
+            _log("WARN", "QT", "PyQt initialization failed; using Win32 tray", error=exc)
             # Fall back to Win32 tray if PyQt is missing/broken.
             pass
 
@@ -1769,7 +1987,8 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
             if not url:
                 return
 
-            _append_log_line(f"trigger {mode}: {url}")
+            operation_id = _next_download_id()
+            _log("DEBUG", "DOWNLOAD", "Requested from tray", operation_id, source="win32_tray")
 
             if playlist:
                 if playlist_downloading:
@@ -1782,13 +2001,6 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
 
             def done_cb(err: Optional[str]) -> None:
                 nonlocal playlist_index, playlist_count, playlist_downloading, playlist_cancel_event
-                if err:
-                    if "canceled" in err.lower():
-                        _append_log_line(f"{mode} canceled")
-                    else:
-                        _append_log_line(f"{mode} failed: {err}")
-                else:
-                    _append_log_line(f"{mode} done")
                 if playlist:
                     playlist_downloading = False
                     playlist_cancel_event = None
@@ -1811,6 +2023,7 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
                     done_cb,
                     extra_hook,
                     playlist_cancel_event if playlist else None,
+                    operation_id,
                 ),
                 daemon=True,
             ).start()
@@ -2072,7 +2285,11 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
         except Exception:
             pass
 
+        _log("INFO", "QT", "System tray initialized", backend="win32")
+        _log("INFO", "APP", "Application ready")
+        _log_separator()
         win32gui.PumpMessages()
+        _log("INFO", "APP", "Application shutdown", exit_code=0)
         return 0
     except Exception as exc:  # pragma: no cover
         _write_crash_log("Tray startup failed", exc)
@@ -2629,7 +2846,8 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
                 q = f"{int(audio_bitrate)}kbps" if isinstance(audio_bitrate, int) and audio_bitrate else "best"
             else:
                 q = f"{int(video_height)}p" if isinstance(video_height, int) and video_height else "best"
-            _append_log_line(f"auto: trigger {mode} ({q}){' playlist' if playlist else ''}: {url}")
+            operation_id = _next_download_id()
+            _log("DEBUG", "DOWNLOAD", "Requested from HTTP", operation_id, source="localhost", quality=q)
 
             cancel_event = threading.Event()
             try:
@@ -2642,10 +2860,6 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
 
             def done_cb(err: Optional[str]) -> None:
                 try:
-                    if err:
-                        _append_log_line(f"auto: failed: {err}")
-                    else:
-                        _append_log_line("auto: done")
                     bridge.progressChanged.emit(100)
                     bridge.statusChanged.emit("Done")
                     bridge.hideProgress.emit()
@@ -2665,6 +2879,7 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
                     done_cb,
                     _auto_progress_hook,
                     cancel_event,
+                    operation_id,
                 ),
                 daemon=True,
             ).start()
@@ -3403,7 +3618,8 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
             if not url:
                 return
 
-            _append_log_line(f"trigger {mode}: {url}")
+            operation_id = _next_download_id()
+            _log("DEBUG", "DOWNLOAD", "Requested from tray", operation_id, source="qt_tray")
 
             if playlist:
                 if playlist_downloading:
@@ -3424,14 +3640,6 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
 
             def done_cb(err: Optional[str]) -> None:
                 nonlocal playlist_index, playlist_count, playlist_downloading, playlist_cancel_event
-                if err:
-                    if "canceled" in err.lower():
-                        _append_log_line(f"{mode} canceled")
-                    else:
-                        _append_log_line(f"{mode} failed: {err}")
-                else:
-                    _append_log_line(f"{mode} done")
-
                 try:
                     bridge.progressChanged.emit(100)
                     bridge.statusChanged.emit("Done")
@@ -3466,6 +3674,7 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
                     done_cb,
                     extra_hook,
                     cancel_event,
+                    operation_id,
                 ),
                 daemon=True,
             ).start()
@@ -3505,12 +3714,17 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
             visible = bool(tray.isVisible())
         except Exception:
             visible = False
-        _append_log_line(f"qt: trayVisible={visible}")
+        _log("DEBUG", "QT", "Tray visibility checked", visible=visible)
         if not visible:
             # Force fallback to Win32 tray if Qt couldn't show.
             tray.hide()
             raise RuntimeError("Qt tray icon not visible")
-        return int(app.exec())
+        _log("INFO", "QT", "System tray initialized")
+        _log("INFO", "APP", "Application ready")
+        _log_separator()
+        exit_code = int(app.exec())
+        _log("INFO", "APP", "Application shutdown", exit_code=exit_code)
+        return exit_code
     except Exception as exc:  # pragma: no cover
         _write_crash_log("PyQt tray startup failed", exc)
         return 1
