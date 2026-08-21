@@ -18,6 +18,13 @@ Then copy ALL `*.dll` files that came with your FFmpeg package (usually in its `
 Alternative:
 Use a "static" FFmpeg build (ffmpeg.exe + ffprobe.exe only), which does not require those extra DLLs.
 
+Git LFS note:
+If one of the `*.exe` files contains text beginning with `version https://git-lfs.github.com/spec/v1`, it is an unresolved Git LFS pointer, not an executable. Run `git lfs pull`. If the LFS payload is unavailable, run:
+
+	.\build.ps1 -AutoYtDlp -AutoFfmpeg
+
+The build script downloads and validates replacement Windows binaries before packaging.
+
 You can use a prebuilt Windows FFmpeg build, or build FFmpeg yourself.
 
 Licensing note:

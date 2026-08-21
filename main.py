@@ -6,8 +6,10 @@ import traceback
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import winreg
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
@@ -15,6 +17,23 @@ from typing import Any, Callable, Optional, cast
 import json
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from app_version import (
+    APP_EXECUTABLE_NAME,
+    APP_VERSION,
+    GITHUB_REPOSITORY,
+    RELEASE_MANIFEST_ASSET,
+    UPDATER_EXECUTABLE_NAME,
+)
+from update_core import (
+    SemanticVersion,
+    UpdateError,
+    UpdateManifest,
+    fetch_latest_github_release,
+    file_matches_manifest,
+    format_byte_count,
+    resolve_install_path,
+)
 
 
 def _default_download_dir() -> Path:
@@ -84,6 +103,8 @@ _REG_DOWNLOAD_DIR = "DownloadDir"
 _REG_PROGRESS_X = "ProgressWidgetX"
 _REG_PROGRESS_Y = "ProgressWidgetY"
 _REG_YTDLP_LAST_UPDATE_CHECK = "YtDlpLastUpdateCheck"
+_REG_APP_UPDATE_LAST_CHECK = "AppUpdateLastCheck"
+_REG_APP_UPDATE_CACHE = "AppUpdateCache"
 
 _YTDLP_LOCK = threading.Lock()
 
@@ -94,6 +115,23 @@ _YTDLP_VERSION_CACHE_LOCK = threading.Lock()
 _YTDLP_VERSION_CACHE_VALUE: Optional[str] = None
 _YTDLP_VERSION_CACHE_TS: float = 0.0
 _YTDLP_VERSION_REFRESHING = False
+
+_APP_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
+_APP_UPDATE_STATE_LOCK = threading.Lock()
+_APP_UPDATE_CHECKING = False
+_APP_UPDATE_LAUNCHING = False
+_APP_UPDATE_LAST_ERROR: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _ApplicationUpdateInfo:
+    manifest: UpdateManifest
+    download_bytes: int
+    download_file_count: int
+    checked_at: int
+
+
+_APP_UPDATE_INFO: Optional[_ApplicationUpdateInfo] = None
 
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
 _LOG_WRITE_LOCK = threading.Lock()
@@ -453,6 +491,91 @@ def _executable_dir() -> Optional[Path]:
     return None
 
 
+def _is_valid_windows_executable(path: Path) -> bool:
+    """Return whether a file has the minimum PE headers needed by Windows."""
+
+    if os.name != "nt":
+        return path.is_file()
+    try:
+        with path.open("rb") as stream:
+            dos_header = stream.read(64)
+            if len(dos_header) != 64 or dos_header[:2] != b"MZ":
+                return False
+            pe_offset = int.from_bytes(dos_header[60:64], "little")
+            if pe_offset < 64:
+                return False
+            stream.seek(0, os.SEEK_END)
+            if pe_offset > stream.tell() - 4:
+                return False
+            stream.seek(pe_offset)
+            return stream.read(4) == b"PE\0\0"
+    except OSError:
+        return False
+
+
+def _is_git_lfs_pointer(path: Path) -> bool:
+    try:
+        with path.open("rb") as stream:
+            return stream.read(64).startswith(b"version https://git-lfs.github.com/spec/v1")
+    except OSError:
+        return False
+
+
+def _ytdlp_candidate_paths() -> list[Path]:
+    candidates: list[Path] = []
+    env = (
+        os.environ.get("YTDLP_EXE")
+        or os.environ.get("YTDLP_PATH")
+        or os.environ.get("YTDLP")
+        or os.environ.get("YT_DLP")
+    )
+    if env:
+        try:
+            candidates.append(Path(env))
+        except Exception:
+            pass
+
+    exe_dir = _executable_dir()
+    if exe_dir:
+        candidates.extend(
+            (
+                exe_dir / "yt-dlp.exe",
+                exe_dir / "vendor" / "yt-dlp.exe",
+                exe_dir / "_internal" / "yt-dlp.exe",
+                exe_dir / "_internal" / "vendor" / "yt-dlp.exe",
+            )
+        )
+
+    bundled = _bundled_dir()
+    if bundled:
+        candidates.append(bundled / "yt-dlp.exe")
+
+    candidates.append(Path(__file__).resolve().parent / "vendor" / "yt-dlp.exe")
+    which = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    if which:
+        try:
+            candidates.append(Path(which))
+        except Exception:
+            pass
+    return candidates
+
+
+def _ytdlp_unavailable_message() -> str:
+    for candidate in _ytdlp_candidate_paths():
+        try:
+            if not candidate.is_file():
+                continue
+            if _is_git_lfs_pointer(candidate):
+                return (
+                    "yt-dlp.exe is an unresolved Git LFS pointer, not a Windows executable. "
+                    "Reinstall Naughty Koharu or replace yt-dlp.exe with the official Windows release."
+                )
+            return f"yt-dlp.exe is not a valid Windows executable: {candidate}"
+        except OSError:
+            continue
+    return "yt-dlp.exe not found. Put yt-dlp.exe next to the app (or set YTDLP_EXE)."
+
+
 def _resolve_ffmpeg_dir(cli_ffmpeg_dir: Optional[str]) -> Optional[Path]:
     if cli_ffmpeg_dir:
         p = Path(cli_ffmpeg_dir)
@@ -477,50 +600,9 @@ def _resolve_ffmpeg_dir(cli_ffmpeg_dir: Optional[str]) -> Optional[Path]:
 
 
 def _resolve_ytdlp_exe() -> Optional[Path]:
-    env = (
-        os.environ.get("YTDLP_EXE")
-        or os.environ.get("YTDLP_PATH")
-        or os.environ.get("YTDLP")
-        or os.environ.get("YT_DLP")
-    )
-    if env:
-        try:
-            p = Path(env)
-            if p.exists():
-                return p
-        except Exception:
-            pass
-
-    exe_dir = _executable_dir()
-    if exe_dir:
-        for candidate in (
-            exe_dir / "yt-dlp.exe",
-            exe_dir / "vendor" / "yt-dlp.exe",
-            exe_dir / "_internal" / "yt-dlp.exe",
-            exe_dir / "_internal" / "vendor" / "yt-dlp.exe",
-        ):
-            if candidate.exists():
-                return candidate
-
-    # In onefile mode, _MEIPASS is an extracted internal temp dir.
-    # Keep this after exe_dir so an external yt-dlp.exe next to the app wins.
-    bundled = _bundled_dir()
-    if bundled:
-        p = bundled / "yt-dlp.exe"
-        if p.exists():
-            return p
-
-    vendor = Path(__file__).resolve().parent / "vendor"
-    p = vendor / "yt-dlp.exe"
-    if p.exists():
-        return p
-
-    which = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-    if which:
-        try:
-            return Path(which)
-        except Exception:
-            return None
+    for candidate in _ytdlp_candidate_paths():
+        if _is_valid_windows_executable(candidate):
+            return candidate
     return None
 
 
@@ -554,6 +636,231 @@ def _set_reg_int(name: str, value: int) -> None:
                 winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value) & 0xFFFFFFFF)
     except Exception:
         return
+
+
+def _get_reg_str(name: str) -> Optional[str]:
+    if os.name != "nt":
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APP_REG_KEY, 0, winreg.KEY_READ) as key:
+            value, value_type = winreg.QueryValueEx(key, name)
+            if value_type == winreg.REG_SZ and isinstance(value, str) and value.strip():
+                return value.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _set_reg_str(name: str, value: Optional[str]) -> None:
+    if os.name != "nt":
+        return
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _APP_REG_KEY) as key:
+            if value is None:
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+                return
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(value))
+    except Exception:
+        return
+
+
+def _build_application_update_info(manifest: UpdateManifest, checked_at: int) -> _ApplicationUpdateInfo:
+    install_dir = _executable_dir()
+    download_bytes = 0
+    download_file_count = 0
+    if install_dir is not None:
+        for manifest_file in manifest.files:
+            destination = resolve_install_path(install_dir, manifest_file.path)
+            if file_matches_manifest(destination, manifest_file):
+                continue
+            download_file_count += 1
+            if manifest_file.size is not None:
+                download_bytes += int(manifest_file.size)
+    else:
+        download_file_count = len(manifest.files)
+        download_bytes = sum(int(item.size or 0) for item in manifest.files)
+    return _ApplicationUpdateInfo(manifest, download_bytes, download_file_count, checked_at)
+
+
+def _cache_application_update(manifest: UpdateManifest, info: Optional[_ApplicationUpdateInfo], checked_at: int) -> None:
+    try:
+        payload: dict[str, object] = {
+            "checked_at": int(checked_at),
+            "manifest": manifest.to_dict(),
+        }
+        if info is not None:
+            payload["download_bytes"] = int(info.download_bytes)
+            payload["download_file_count"] = int(info.download_file_count)
+        _set_reg_str(_REG_APP_UPDATE_CACHE, json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        pass
+
+
+def _load_cached_application_update() -> None:
+    global _APP_UPDATE_INFO
+    cached = _get_reg_str(_REG_APP_UPDATE_CACHE)
+    if not cached:
+        return
+    try:
+        payload = json.loads(cached)
+        if not isinstance(payload, dict):
+            return
+        raw_manifest = payload.get("manifest")
+        manifest = UpdateManifest.from_dict(raw_manifest)
+        if manifest.test_only or manifest.version <= SemanticVersion.parse(APP_VERSION):
+            return
+        checked_at = payload.get("checked_at")
+        download_bytes = payload.get("download_bytes")
+        download_file_count = payload.get("download_file_count")
+        if not isinstance(checked_at, int) or not isinstance(download_bytes, int) or not isinstance(download_file_count, int):
+            return
+        cached_info = _ApplicationUpdateInfo(manifest, max(0, download_bytes), max(0, download_file_count), checked_at)
+        with _APP_UPDATE_STATE_LOCK:
+            _APP_UPDATE_INFO = cached_info
+    except Exception:
+        return
+
+
+def _get_application_update_state() -> tuple[Optional[_ApplicationUpdateInfo], bool, Optional[str]]:
+    with _APP_UPDATE_STATE_LOCK:
+        return _APP_UPDATE_INFO, bool(_APP_UPDATE_CHECKING), _APP_UPDATE_LAST_ERROR
+
+
+def _application_update_label(info: _ApplicationUpdateInfo) -> str:
+    size_label = format_byte_count(info.download_bytes)
+    return f"Update to {info.manifest.version} ({size_label})"
+
+
+def _start_application_update_check(
+    *,
+    force: bool,
+    on_done: Optional[Callable[[Optional[_ApplicationUpdateInfo], Optional[str]], None]] = None,
+) -> bool:
+    """Check the latest public release in a worker without blocking the tray."""
+
+    if _executable_dir() is None:
+        _log("DEBUG", "APPUPD", "Application update check skipped", reason="not_frozen")
+        return False
+
+    now = int(time.time())
+    with _APP_UPDATE_STATE_LOCK:
+        global _APP_UPDATE_CHECKING, _APP_UPDATE_LAST_ERROR, _APP_UPDATE_INFO
+        if _APP_UPDATE_CHECKING:
+            return False
+        last_check = _get_reg_int(_REG_APP_UPDATE_LAST_CHECK) or 0
+        if not force and last_check and (now - last_check) < _APP_UPDATE_CHECK_INTERVAL_SECONDS:
+            return False
+        _APP_UPDATE_CHECKING = True
+        _APP_UPDATE_LAST_ERROR = None
+    _set_reg_int(_REG_APP_UPDATE_LAST_CHECK, now)
+
+    def worker() -> None:
+        discovered: Optional[_ApplicationUpdateInfo] = None
+        error: Optional[str] = None
+        try:
+            release = fetch_latest_github_release(GITHUB_REPOSITORY, RELEASE_MANIFEST_ASSET, timeout=10.0)
+            manifest = release.manifest
+            if manifest.test_only:
+                raise UpdateError("GitHub returned a test-only update manifest.")
+            if manifest.version > SemanticVersion.parse(APP_VERSION):
+                discovered = _build_application_update_info(manifest, now)
+                _cache_application_update(manifest, discovered, now)
+                _log(
+                    "INFO",
+                    "APPUPD",
+                    "Application update available",
+                    current=APP_VERSION,
+                    available=manifest.version,
+                    files=discovered.download_file_count,
+                    bytes=discovered.download_bytes,
+                )
+            else:
+                _cache_application_update(manifest, None, now)
+                _log("INFO", "APPUPD", "Application is current", current=APP_VERSION, latest=manifest.version)
+        except UpdateError as exc:
+            error = str(exc)
+            _log("WARN", "APPUPD", "Application update check failed", error=exc, detail=exc.detail)
+        except Exception as exc:
+            error = "Could not check for application updates."
+            _log("WARN", "APPUPD", "Application update check failed", error=exc)
+        finally:
+            with _APP_UPDATE_STATE_LOCK:
+                if error is None:
+                    _APP_UPDATE_INFO = discovered
+                _APP_UPDATE_LAST_ERROR = error
+                _APP_UPDATE_CHECKING = False
+            if on_done is not None:
+                try:
+                    on_done(discovered, error)
+                except Exception:
+                    pass
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
+def _launch_application_updater(manifest: UpdateManifest) -> tuple[bool, str]:
+    """Start a disposable updater copy so updater.exe can be replaced safely."""
+
+    install_dir = _executable_dir()
+    if install_dir is None:
+        return False, "Application updates are available only from an installed build."
+    updater_source = install_dir / UPDATER_EXECUTABLE_NAME
+    if not updater_source.is_file():
+        return False, "Update support is not installed. Use the full installer once to add it."
+
+    with _APP_UPDATE_STATE_LOCK:
+        global _APP_UPDATE_LAUNCHING
+        if _APP_UPDATE_LAUNCHING:
+            return False, "An application update is already starting."
+        _APP_UPDATE_LAUNCHING = True
+
+    session_dir: Optional[Path] = None
+    try:
+        session_dir = Path(tempfile.mkdtemp(prefix="NaughtyKoharuUpdate-"))
+        manifest_path = session_dir / "update-manifest.json"
+        manifest_path.write_text(json.dumps(manifest.to_dict(), indent=2), encoding="utf-8")
+        updater_copy = session_dir / UPDATER_EXECUTABLE_NAME
+        shutil.copy2(updater_source, updater_copy)
+
+        command = [
+            str(updater_copy),
+            "--install-dir",
+            str(install_dir),
+            "--manifest",
+            str(manifest_path),
+            "--parent-pid",
+            str(os.getpid()),
+            "--launch",
+            APP_EXECUTABLE_NAME,
+        ]
+        kwargs: dict[str, Any] = {
+            "cwd": str(session_dir),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(command, **kwargs)
+        _log("INFO", "APPUPD", "Launched temporary updater", version=manifest.version, path=updater_copy)
+        return True, ""
+    except Exception as exc:
+        _log("ERROR", "APPUPD", "Updater launch failed", error=exc)
+        if session_dir is not None:
+            try:
+                shutil.rmtree(session_dir)
+            except OSError:
+                pass
+        with _APP_UPDATE_STATE_LOCK:
+            _APP_UPDATE_LAUNCHING = False
+        return False, "Could not start the updater. See the application log for details."
 
 
 def _maybe_autoupdate_ytdlp(check_every_seconds: int = 24 * 60 * 60) -> None:
@@ -992,6 +1299,10 @@ def _ffmpeg_healthcheck(ffmpeg_dir: Optional[Path]) -> Optional[str]:
 
     if not ffmpeg_path.exists():
         return f"Missing: {ffmpeg_path}"
+    if not _is_valid_windows_executable(ffmpeg_path):
+        if _is_git_lfs_pointer(ffmpeg_path):
+            return "FFmpeg is an unresolved Git LFS pointer, not a Windows executable. Reinstall Naughty Koharu."
+        return f"FFmpeg is not a valid Windows executable: {ffmpeg_path}"
 
     # ffprobe is optional for some flows but yt-dlp uses it for metadata.
     if not ffprobe_path.exists():
@@ -999,6 +1310,10 @@ def _ffmpeg_healthcheck(ffmpeg_dir: Optional[Path]) -> Optional[str]:
             f"Missing: {ffprobe_path}\n\n"
             "Fix: Put ffprobe.exe next to ffmpeg.exe (recommended)."
         )
+    if not _is_valid_windows_executable(ffprobe_path):
+        if _is_git_lfs_pointer(ffprobe_path):
+            return "FFprobe is an unresolved Git LFS pointer, not a Windows executable. Reinstall Naughty Koharu."
+        return f"FFprobe is not a valid Windows executable: {ffprobe_path}"
 
     # Do NOT execute ffmpeg.exe here; if it's a shared build missing DLLs,
     # Windows will pop multiple system dialogs (one per missing DLL).
@@ -1544,8 +1859,8 @@ def _download_with_ytdlp(
             return "UNEXPECTED_RESPONSE"
         if "requested format" in low or "format not available" in low:
             return "FORMAT_UNAVAILABLE"
-        if "yt-dlp.exe not found" in low:
-            return "YTDLP_NOT_FOUND"
+        if "yt-dlp.exe" in low and ("not found" in low or "not a valid" in low or "git lfs pointer" in low):
+            return "YTDLP_INVALID"
         return "YTDLP_FAILED"
 
     _log_separator(blank_line=True)
@@ -1602,10 +1917,9 @@ def _download_with_ytdlp(
     try:
         ytdlp_exe = _resolve_ytdlp_exe()
         if not ytdlp_exe or not ytdlp_exe.exists():
-            _log("ERROR", "DOWNLOAD", "Failed", operation_id, reason="YTDLP_NOT_FOUND")
-            done_cb(
-                "yt-dlp.exe not found. Put yt-dlp.exe next to the app (or set YTDLP_EXE)."
-            )
+            message = _ytdlp_unavailable_message()
+            _log("ERROR", "DOWNLOAD", "Failed", operation_id, reason="YTDLP_INVALID", detail=message)
+            done_cb(message)
             return
 
         if playlist:
@@ -1780,7 +2094,7 @@ def run() -> int:
 
     ytdlp_exe = _resolve_ytdlp_exe()
     if not ytdlp_exe or not ytdlp_exe.exists():
-        print("yt-dlp.exe not found. Put yt-dlp.exe next to the app (or set YTDLP_EXE).", file=sys.stderr)
+        print(_ytdlp_unavailable_message(), file=sys.stderr)
         if _is_frozen():
             try:
                 input("\nPress Enter to exit...")
@@ -1814,7 +2128,8 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
     # Clipboard URL is used for actions; if clipboard doesn't contain a URL, do nothing (no popup).
     try:
         _log_separator()
-        _log("INFO", "APP", "Application starting")
+        _log("INFO", "APP", "Application starting", version=APP_VERSION)
+        _load_cached_application_update()
         # Fire-and-forget yt-dlp update check. (No UI, logs only.)
         _maybe_autoupdate_ytdlp()
         _schedule_ytdlp_version_refresh(force=True)
@@ -1859,6 +2174,7 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
 
         callback_msg = win32con.WM_USER + 20
         WM_UPDATE_TIP = win32con.WM_APP + 1
+        WM_APP_UPDATE_CHECK_DONE = win32con.WM_APP + 2
         try:
             WM_TASKBARCREATED = win32gui.RegisterWindowMessage("TaskbarCreated")
         except Exception:
@@ -1882,6 +2198,8 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
         # Tooltip updates must run on the tray window thread.
         tip_lock = threading.Lock()
         tip_pending: Optional[str] = None
+        app_update_notice_lock = threading.Lock()
+        app_update_notice: Optional[tuple[Optional[_ApplicationUpdateInfo], Optional[str], bool]] = None
 
         def request_tray_tooltip_update(hwnd) -> None:
             nonlocal tip_pending
@@ -1901,6 +2219,9 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
         ID_PROGRESS_POS_RESET = 2013
         ID_YTDLP_VERSION = 2014
         ID_YTDLP_FORCE_UPDATE = 2015
+        ID_APP_VERSION = 2016
+        ID_APP_CHECK = 2017
+        ID_APP_UPDATE = 2018
         ID_PLAYLIST_VIDEO_720 = 2301
         ID_PLAYLIST_VIDEO_1080 = 2302
         ID_PLAYLIST_VIDEO_1440 = 2303
@@ -2048,6 +2369,23 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
             win32gui.AppendMenu(settings_menu, win32con.MF_STRING, ID_PROGRESS_POS_RESET, "Reset position")
 
             try:
+                app_update, app_checking, _app_error = _get_application_update_state()
+                win32gui.AppendMenu(settings_menu, win32con.MF_SEPARATOR, 0, "")
+                win32gui.AppendMenu(
+                    settings_menu,
+                    win32con.MF_STRING | win32con.MF_GRAYED,
+                    ID_APP_VERSION,
+                    f"Application: {APP_VERSION}",
+                )
+                check_flags = win32con.MF_STRING | (win32con.MF_GRAYED if app_checking else 0)
+                check_label = "Checking for application updates..." if app_checking else "Check for application updates"
+                win32gui.AppendMenu(settings_menu, check_flags, ID_APP_CHECK, check_label)
+                if app_update is not None:
+                    win32gui.AppendMenu(settings_menu, win32con.MF_STRING, ID_APP_UPDATE, _application_update_label(app_update))
+            except Exception:
+                pass
+
+            try:
                 win32gui.AppendMenu(settings_menu, win32con.MF_SEPARATOR, 0, "")
                 upd_flags = win32con.MF_STRING | (win32con.MF_GRAYED if _is_ytdlp_updating() else 0)
                 win32gui.AppendMenu(settings_menu, upd_flags, ID_YTDLP_FORCE_UPDATE, "Update yt-dlp now")
@@ -2096,6 +2434,43 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
             win32gui.AppendMenu(menu, win32con.MF_STRING, ID_EXIT, "Exit")
             return menu
 
+        def show_application_update_dialog(hwnd, info: _ApplicationUpdateInfo) -> None:
+            message = (
+                f"Installed version: {APP_VERSION}\n"
+                f"Available version: {info.manifest.version}\n"
+                f"Approximate download: {format_byte_count(info.download_bytes)}\n\n"
+                "Install this update now?"
+            )
+            result = win32gui.MessageBox(
+                hwnd,
+                message,
+                "Naughty Koharu Update",
+                win32con.MB_YESNO | win32con.MB_ICONQUESTION,
+            )
+            if result != win32con.IDYES:
+                return
+            started, error = _launch_application_updater(info.manifest)
+            if not started:
+                win32gui.MessageBox(hwnd, error, "Naughty Koharu Update", win32con.MB_OK | win32con.MB_ICONERROR)
+                return
+            win32gui.DestroyWindow(hwnd)
+
+        def check_application_update_from_win32(hwnd, manual: bool) -> None:
+            def on_done(info: Optional[_ApplicationUpdateInfo], error: Optional[str]) -> None:
+                nonlocal app_update_notice
+                with app_update_notice_lock:
+                    app_update_notice = (info, error, manual)
+                try:
+                    win32gui.PostMessage(hwnd, WM_APP_UPDATE_CHECK_DONE, 0, 0)
+                except Exception:
+                    pass
+
+            started = _start_application_update_check(force=manual, on_done=on_done)
+            if manual and not started:
+                _info, checking, _error = _get_application_update_state()
+                if checking:
+                    win32gui.MessageBox(hwnd, "An update check is already running.", "Naughty Koharu Update", win32con.MB_OK | win32con.MB_ICONINFORMATION)
+
         def handle_menu_command(hwnd, cmd: int) -> None:
             if cmd == ID_AUTOSTART:
                 current = _is_autostart_enabled(app_name)
@@ -2112,6 +2487,12 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
             elif cmd == ID_PROGRESS_POS_RESET:
                 _set_configured_progress_pos(None, None)
                 _append_log_line("progress-pos: reset")
+            elif cmd == ID_APP_CHECK:
+                check_application_update_from_win32(hwnd, manual=True)
+            elif cmd == ID_APP_UPDATE:
+                app_update, _checking, _error = _get_application_update_state()
+                if app_update is not None:
+                    show_application_update_dialog(hwnd, app_update)
             elif cmd == ID_YTDLP_FORCE_UPDATE:
                 started = _start_ytdlp_update(force=True, reason="manual")
                 if started:
@@ -2165,6 +2546,25 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
                         update_tray_tooltip(hwnd, tip)
                 except Exception:
                     pass
+                return 0
+
+            if msg == WM_APP_UPDATE_CHECK_DONE:
+                with app_update_notice_lock:
+                    notice = app_update_notice
+                if notice is not None:
+                    info, error, manual = notice
+                    if manual:
+                        if error:
+                            win32gui.MessageBox(hwnd, error, "Naughty Koharu Update", win32con.MB_OK | win32con.MB_ICONERROR)
+                        elif info is not None:
+                            show_application_update_dialog(hwnd, info)
+                        else:
+                            win32gui.MessageBox(
+                                hwnd,
+                                f"Naughty Koharu {APP_VERSION} is up to date.",
+                                "Naughty Koharu Update",
+                                win32con.MB_OK | win32con.MB_ICONINFORMATION,
+                            )
                 return 0
 
             if WM_TASKBARCREATED and msg == WM_TASKBARCREATED:
@@ -2284,6 +2684,8 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
             win32gui.Shell_NotifyIcon(win32gui.NIM_SETVERSION, (hwnd, tray_icon_id, win32gui.NOTIFYICON_VERSION_4))
         except Exception:
             pass
+
+        check_application_update_from_win32(hwnd, manual=False)
 
         _log("INFO", "QT", "System tray initialized", backend="win32")
         _log("INFO", "APP", "Application ready")
@@ -2440,6 +2842,7 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
             hideProgress = QtCore.pyqtSignal()
             playlistChanged = QtCore.pyqtSignal(int, int)
             autoDownloadRequested = QtCore.pyqtSignal(object)
+            applicationUpdateChecked = QtCore.pyqtSignal(object)
 
         bridge = TrayBridge()
 
@@ -3166,6 +3569,16 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
         submenu_settings.addSeparator()
         submenu_settings.addAction(action_reset_popup_pos)
 
+        action_app_version = QtGui.QAction(f"Application: {APP_VERSION}", submenu_settings)
+        action_app_version.setEnabled(False)
+        action_check_app_update = QtGui.QAction("Check for application updates", submenu_settings)
+        action_install_app_update = QtGui.QAction("", submenu_settings)
+        action_install_app_update.setVisible(False)
+        submenu_settings.addSeparator()
+        submenu_settings.addAction(action_app_version)
+        submenu_settings.addAction(action_check_app_update)
+        submenu_settings.addAction(action_install_app_update)
+
         # yt-dlp controls (keep menu open + update label live)
         submenu_settings.addSeparator()
 
@@ -3483,6 +3896,88 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
 
         action_reset_popup_pos.triggered.connect(reset_popup_position)
 
+        def refresh_application_update_actions() -> None:
+            info, checking, _error = _get_application_update_state()
+            action_app_version.setText(f"Application: {APP_VERSION}")
+            action_check_app_update.setEnabled(not checking)
+            action_check_app_update.setText(
+                "Checking for application updates..." if checking else "Check for application updates"
+            )
+            action_install_app_update.setVisible(info is not None)
+            if info is not None:
+                action_install_app_update.setText(_application_update_label(info))
+
+        def show_application_update_dialog(info: _ApplicationUpdateInfo) -> None:
+            dialog = QtWidgets.QMessageBox()
+            dialog.setIcon(QtWidgets.QMessageBox.Icon.Question)
+            dialog.setWindowTitle("Naughty Koharu Update")
+            dialog.setText("A new version of Naughty Koharu is available.")
+            dialog.setInformativeText(
+                f"Installed version: {APP_VERSION}\n"
+                f"Available version: {info.manifest.version}\n"
+                f"Approximate download: {format_byte_count(info.download_bytes)}\n\n"
+                "Install this update now?"
+            )
+            update_button = dialog.addButton("Update", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            dialog.addButton("Later", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            dialog.exec()
+            if dialog.clickedButton() is not update_button:
+                return
+            started, error = _launch_application_updater(info.manifest)
+            if not started:
+                QtWidgets.QMessageBox.critical(None, "Naughty Koharu Update", error)
+                return
+            tray.hide()
+            app.quit()
+
+        def on_application_update_checked(payload: object) -> None:
+            try:
+                info, error, manual = cast(tuple[Optional[_ApplicationUpdateInfo], Optional[str], bool], payload)
+            except Exception:
+                return
+            refresh_application_update_actions()
+            if manual:
+                if error:
+                    QtWidgets.QMessageBox.warning(None, "Naughty Koharu Update", error)
+                elif info is not None:
+                    show_application_update_dialog(info)
+                else:
+                    QtWidgets.QMessageBox.information(
+                        None,
+                        "Naughty Koharu Update",
+                        f"Naughty Koharu {APP_VERSION} is up to date.",
+                    )
+            elif info is not None:
+                tray.showMessage(
+                    "Naughty Koharu",
+                    f"Version {info.manifest.version} is available. Open Settings to update.",
+                    QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                    6000,
+                )
+
+        def check_application_update_from_qt(manual: bool) -> None:
+            def on_done(info: Optional[_ApplicationUpdateInfo], error: Optional[str]) -> None:
+                bridge.applicationUpdateChecked.emit((info, error, manual))
+
+            started = _start_application_update_check(force=manual, on_done=on_done)
+            refresh_application_update_actions()
+            if manual and not started:
+                info, checking, error = _get_application_update_state()
+                if not checking:
+                    bridge.applicationUpdateChecked.emit((info, error, True))
+
+        action_check_app_update.triggered.connect(lambda _=False: check_application_update_from_qt(True))
+        action_install_app_update.triggered.connect(
+            lambda _=False: (
+                show_application_update_dialog(info)
+                if (info := _get_application_update_state()[0]) is not None
+                else check_application_update_from_qt(True)
+            )
+        )
+        bridge.applicationUpdateChecked.connect(on_application_update_checked)
+        submenu_settings.aboutToShow.connect(refresh_application_update_actions)
+        menu.aboutToShow.connect(refresh_application_update_actions)
+
         menu.addSeparator()
         menu.addAction(action_cancel_playlist)
         menu.addMenu(submenu_playlist)
@@ -3710,6 +4205,7 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
         tray.activated.connect(on_tray_activated)
 
         tray.show()
+        check_application_update_from_qt(False)
         try:
             visible = bool(tray.isVisible())
         except Exception:

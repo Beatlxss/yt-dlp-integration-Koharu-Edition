@@ -5,7 +5,7 @@
 #define MyAppId "{{9A7A2F8E-9A3C-4F76-9E7E-2F2C7A7C37E1}}"
 #define MyAppIdPlain "{9A7A2F8E-9A3C-4F76-9E7E-2F2C7A7C37E1}"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.3.0"
+  #error "Build with build-installer.ps1 so MyAppVersion comes from app_version.py."
 #endif
 
 [Setup]
@@ -39,11 +39,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 ; Install the main exe under the branded filename.
 Source: "..\dist\ytdlp-onefile\ytdlp-onefile.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+; The updater runs from a temporary copy when replacing installed app files.
+Source: "..\dist\ytdlp-onefile\Koharu Updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Install yt-dlp.exe as a separate file so users can drop-in update it later.
 ; onlyifdoesntexist prevents overwriting a user-updated yt-dlp.exe during app upgrades.
 Source: "..\dist\ytdlp-onefile\yt-dlp.exe"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 ; Copy remaining onedir files/folders (including _internal/), excluding original exe name.
-Source: "..\dist\ytdlp-onefile\*"; DestDir: "{app}"; Excludes: "ytdlp-onefile.exe,yt-dlp.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\ytdlp-onefile\*"; DestDir: "{app}"; Excludes: "ytdlp-onefile.exe,yt-dlp.exe,Koharu Updater.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

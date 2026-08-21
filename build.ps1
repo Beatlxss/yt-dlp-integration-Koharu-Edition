@@ -28,6 +28,57 @@ $VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 & $VenvPython -m pip install --upgrade pip
 & $VenvPython -m pip install --upgrade pyinstaller pywin32 pefile PyQt6
 
+function Test-WindowsPeFile {
+    param([string]$Path)
+
+    try {
+        if (!(Test-Path $Path)) { return $false }
+
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            if ($stream.Length -lt 64) { return $false }
+
+            $dosHeader = New-Object byte[] 64
+            if ($stream.Read($dosHeader, 0, $dosHeader.Length) -ne $dosHeader.Length) {
+                return $false
+            }
+            if ($dosHeader[0] -ne 0x4D -or $dosHeader[1] -ne 0x5A) { return $false }
+
+            $peOffset = [System.BitConverter]::ToInt32($dosHeader, 0x3C)
+            if ($peOffset -lt 64 -or $peOffset -gt ($stream.Length - 4)) { return $false }
+
+            $stream.Seek($peOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $signature = New-Object byte[] 4
+            if ($stream.Read($signature, 0, $signature.Length) -ne $signature.Length) {
+                return $false
+            }
+            return ($signature[0] -eq 0x50 -and $signature[1] -eq 0x45 -and $signature[2] -eq 0 -and $signature[3] -eq 0)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-InvalidBinaryHint {
+    param([string]$Path)
+
+    if (!(Test-Path $Path)) { return "missing" }
+    try {
+        $prefix = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($Path)[0..63])
+        if ($prefix.StartsWith("version https://git-lfs.github.com/spec/v1")) {
+            return "an unresolved Git LFS pointer"
+        }
+    }
+    catch {
+        # Use the generic message below when the file cannot be read.
+    }
+    return "not a valid Windows executable"
+}
+
 function Initialize-YtDlpInVendor {
     param(
         [string]$VendorDir,
@@ -35,13 +86,27 @@ function Initialize-YtDlpInVendor {
     )
 
     $ytdlp = Join-Path $VendorDir "yt-dlp.exe"
-    if (!$Force -and (Test-Path $ytdlp)) {
+    if (!$Force -and (Test-WindowsPeFile $ytdlp)) {
         return
     }
 
+    if (Test-Path $ytdlp) {
+        Write-Warning "Replacing $ytdlp because it is $(Get-InvalidBinaryHint $ytdlp)."
+    }
+
     $url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+    $temporary = "$ytdlp.download-$([Guid]::NewGuid().ToString('N'))"
     Write-Host "Downloading yt-dlp.exe from: $url"
-    Invoke-WebRequest -Uri $url -OutFile $ytdlp
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $temporary
+        if (!(Test-WindowsPeFile $temporary)) {
+            throw "Downloaded yt-dlp.exe is not a valid Windows executable."
+        }
+        Move-Item -Force $temporary $ytdlp
+    }
+    finally {
+        Remove-Item -Force $temporary -ErrorAction SilentlyContinue
+    }
 }
 function Initialize-FfmpegInVendor {
     param(
@@ -52,8 +117,14 @@ function Initialize-FfmpegInVendor {
     $ffmpeg = Join-Path $VendorDir "ffmpeg.exe"
     $ffprobe = Join-Path $VendorDir "ffprobe.exe"
 
-    if (!$Force -and (Test-Path $ffmpeg) -and (Test-Path $ffprobe)) {
+    if (!$Force -and (Test-WindowsPeFile $ffmpeg) -and (Test-WindowsPeFile $ffprobe)) {
         return
+    }
+
+    foreach ($candidate in @($ffmpeg, $ffprobe)) {
+        if (Test-Path $candidate) {
+            Write-Warning "Replacing $candidate because it is $(Get-InvalidBinaryHint $candidate)."
+        }
     }
 
     # Static build (no avcodec-*.dll required)
@@ -77,8 +148,21 @@ function Initialize-FfmpegInVendor {
     if (!(Test-Path $srcFfmpeg)) { throw "ffmpeg.exe not found in downloaded archive." }
     if (!(Test-Path $srcFfprobe)) { throw "ffprobe.exe not found in downloaded archive." }
 
-    Copy-Item -Force $srcFfmpeg $ffmpeg
-    Copy-Item -Force $srcFfprobe $ffprobe
+    if (!(Test-WindowsPeFile $srcFfmpeg) -or !(Test-WindowsPeFile $srcFfprobe)) {
+        throw "Downloaded FFmpeg archive did not contain valid Windows executables."
+    }
+
+    $tmpFfmpeg = "$ffmpeg.download-$([Guid]::NewGuid().ToString('N'))"
+    $tmpFfprobe = "$ffprobe.download-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Copy-Item -Force $srcFfmpeg $tmpFfmpeg
+        Copy-Item -Force $srcFfprobe $tmpFfprobe
+        Move-Item -Force $tmpFfmpeg $ffmpeg
+        Move-Item -Force $tmpFfprobe $ffprobe
+    }
+    finally {
+        Remove-Item -Force $tmpFfmpeg, $tmpFfprobe -ErrorAction SilentlyContinue
+    }
 
     # Clean up temp
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -100,12 +184,16 @@ if ($AutoYtDlp) {
     Initialize-YtDlpInVendor -VendorDir (Join-Path $Root "vendor") -Force
 }
 
-if (!(Test-Path $Ffmpeg)) {
-    Write-Error "Missing $Ffmpeg. Put ffmpeg.exe in onefile/vendor/ before building (or pass -AutoFfmpeg)."
+if (!(Test-WindowsPeFile $Ffmpeg)) {
+    Write-Error "Invalid $Ffmpeg ($(Get-InvalidBinaryHint $Ffmpeg)). Run git lfs pull or build with -AutoFfmpeg."
 }
 
-if (!(Test-Path $YtDlpExe)) {
-    Write-Error "Missing $YtDlpExe. Put yt-dlp.exe in onefile/vendor/ before building (or pass -AutoYtDlp)."
+if ((Test-Path $Ffprobe) -and !(Test-WindowsPeFile $Ffprobe)) {
+    Write-Error "Invalid $Ffprobe ($(Get-InvalidBinaryHint $Ffprobe)). Run git lfs pull or build with -AutoFfmpeg."
+}
+
+if (!(Test-WindowsPeFile $YtDlpExe)) {
+    Write-Error "Invalid $YtDlpExe ($(Get-InvalidBinaryHint $YtDlpExe)). Run git lfs pull or build with -AutoYtDlp."
 }
 
 $AddBinaryArgs = @(
@@ -154,6 +242,8 @@ if ($Mode -eq "onefile") {
     $ModeArgs = @("--onefile")
 }
 
+$AppSpec = Join-Path $Root "build\app-spec"
+
 & $VenvPython -m PyInstaller `
     --noconfirm `
     --clean `
@@ -161,10 +251,15 @@ if ($Mode -eq "onefile") {
     --noconsole `
     --exclude-module yt_dlp `
     --name "ytdlp-onefile" `
+    --specpath $AppSpec `
     @IconArgs `
     @GifArgs `
     @AddBinaryArgs `
     "$Root\main.py"
+
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed while building the application."
+}
 
 # Ship yt-dlp.exe as a *separate* file next to the app (so it can be updated without rebuilding).
 if ($Mode -eq "onefile") {
@@ -176,6 +271,46 @@ else {
     Copy-Item -Force $YtDlpExe $ExternalYtDlpOut
 }
 
+# The updater is a separate onefile executable so it can run after the app closes
+# and safely replace the onedir executable or its own installed copy.
+$UpdaterSource = Join-Path $Root "updater.py"
+$UpdaterDist = Join-Path $Root "dist\updater-build"
+$UpdaterWork = Join-Path $Root "build\updater"
+$UpdaterSpec = Join-Path $Root "build\updater-spec"
+if (!(Test-Path $UpdaterSource)) {
+    throw "Missing updater source: $UpdaterSource"
+}
+
+& $VenvPython -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --noconsole `
+    --hidden-import tkinter `
+    --name "Koharu Updater" `
+    @IconArgs `
+    --distpath $UpdaterDist `
+    --workpath $UpdaterWork `
+    --specpath $UpdaterSpec `
+    $UpdaterSource
+
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed while building the updater."
+}
+
+$UpdaterBuilt = Join-Path $UpdaterDist "Koharu Updater.exe"
+if (!(Test-Path $UpdaterBuilt)) {
+    throw "Updater build output is missing: $UpdaterBuilt"
+}
+
+if ($Mode -eq "onefile") {
+    $UpdaterOut = Join-Path $Root "dist\Koharu Updater.exe"
+}
+else {
+    $UpdaterOut = Join-Path $Root "dist\ytdlp-onefile\Koharu Updater.exe"
+}
+Copy-Item -Force $UpdaterBuilt $UpdaterOut
+
 if ($Mode -eq "onefile") {
     Write-Host "Built: $Root\dist\ytdlp-onefile.exe"
 }
@@ -183,3 +318,4 @@ else {
     Write-Host "Built: $Root\dist\ytdlp-onefile\ytdlp-onefile.exe"
 }
 Write-Host "External yt-dlp: $ExternalYtDlpOut"
+Write-Host "Updater: $UpdaterOut"

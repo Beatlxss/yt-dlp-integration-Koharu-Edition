@@ -1,7 +1,9 @@
 /dist/
 /dist-installer/
+/dist-update/
 /build/
 /.venv/
+__pycache__/
 ytdlp-onefile.spec
 /browser-extension/.vscode/
 .github
