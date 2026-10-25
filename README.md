@@ -37,6 +37,7 @@ Application logs are written to `%TEMP%\\ytdlp-onefile.log` using searchable, ti
 
 - youtube/youtube music, twitter/x, reddit, tiktok (WIP)
 - every has independent download button
+- X GIFs are converted from MP4 to GIF with the local app's bundled FFmpeg and saved to the configured download folder.
 
 ## Application updates
 
@@ -51,7 +52,7 @@ Naughty Koharu keeps the existing Inno Setup installer for first installs, clean
 - `installer/ytdlp-onefile.iss` requires the build script to supply that value, preventing an installer/app version mismatch.
 - GitHub release tags must be `v` followed by that same value, such as `v1.3.1`.
 
-Update checking runs in the background after tray startup, uses a six-hour HKCU cache, and can be triggered manually from `Settings > Check for application updates`. Network/API failures do not prevent startup. When an update is available, the menu shows the installed version, available version, and approximate changed-file download size.
+Update checking runs in the background once after tray startup and can be triggered manually from `Settings > Check for updates`. Network/API failures do not prevent startup. When an update is available, the menu shows the installed version, available version, and approximate changed-file download size.
 
 ### How updates work
 

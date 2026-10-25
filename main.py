@@ -103,7 +103,6 @@ _REG_DOWNLOAD_DIR = "DownloadDir"
 _REG_PROGRESS_X = "ProgressWidgetX"
 _REG_PROGRESS_Y = "ProgressWidgetY"
 _REG_YTDLP_LAST_UPDATE_CHECK = "YtDlpLastUpdateCheck"
-_REG_APP_UPDATE_LAST_CHECK = "AppUpdateLastCheck"
 _REG_APP_UPDATE_CACHE = "AppUpdateCache"
 
 _YTDLP_LOCK = threading.Lock()
@@ -116,7 +115,6 @@ _YTDLP_VERSION_CACHE_VALUE: Optional[str] = None
 _YTDLP_VERSION_CACHE_TS: float = 0.0
 _YTDLP_VERSION_REFRESHING = False
 
-_APP_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 _APP_UPDATE_STATE_LOCK = threading.Lock()
 _APP_UPDATE_CHECKING = False
 _APP_UPDATE_LAUNCHING = False
@@ -752,12 +750,8 @@ def _start_application_update_check(
         global _APP_UPDATE_CHECKING, _APP_UPDATE_LAST_ERROR, _APP_UPDATE_INFO
         if _APP_UPDATE_CHECKING:
             return False
-        last_check = _get_reg_int(_REG_APP_UPDATE_LAST_CHECK) or 0
-        if not force and last_check and (now - last_check) < _APP_UPDATE_CHECK_INTERVAL_SECONDS:
-            return False
         _APP_UPDATE_CHECKING = True
         _APP_UPDATE_LAST_ERROR = None
-    _set_reg_int(_REG_APP_UPDATE_LAST_CHECK, now)
 
     def worker() -> None:
         discovered: Optional[_ApplicationUpdateInfo] = None
@@ -1438,7 +1432,7 @@ def _normalize_download_request(obj: Any) -> Optional[dict[str, Any]]:
             return None
 
         mode = str(obj.get("mode") or "video").strip().lower()
-        if mode not in ("video", "music"):
+        if mode not in ("video", "music", "gif"):
             mode = "video"
 
         playlist = bool(obj.get("playlist") or False)
@@ -1461,7 +1455,7 @@ def _normalize_download_request(obj: Any) -> Optional[dict[str, Any]]:
         except Exception:
             audio_bitrate_i = None
 
-        if mode == "video":
+        if mode in ("video", "gif"):
             audio_bitrate_i = None
         else:
             video_height_i = None
@@ -1842,6 +1836,8 @@ def _download_with_ytdlp(
     operation_id = operation_id or _next_download_id()
     started_at = time.monotonic()
     download_dir = _effective_download_dir()
+    output_dir = download_dir
+    gif_temp_dir: Optional[tempfile.TemporaryDirectory] = None
     seen_paths: set[Path] = set()
 
     def _platform() -> str:
@@ -1921,6 +1917,21 @@ def _download_with_ytdlp(
             _log("ERROR", "DOWNLOAD", "Failed", operation_id, reason="YTDLP_INVALID", detail=message)
             done_cb(message)
             return
+
+        ffmpeg_exe: Optional[Path] = None
+        if mode == "gif":
+            ffmpeg_exe = (
+                ffmpeg_dir / "ffmpeg.exe"
+                if ffmpeg_dir is not None
+                else None
+            )
+            if ffmpeg_exe is None or not ffmpeg_exe.is_file():
+                system_ffmpeg = shutil.which("ffmpeg")
+                ffmpeg_exe = Path(system_ffmpeg) if system_ffmpeg else None
+            if ffmpeg_exe is None or not ffmpeg_exe.is_file():
+                raise RuntimeError("FFmpeg is required to convert this video to GIF")
+            gif_temp_dir = tempfile.TemporaryDirectory(prefix="koharu-gif-")
+            download_dir = Path(gif_temp_dir.name)
 
         if playlist:
             try:
@@ -2035,6 +2046,79 @@ def _download_with_ytdlp(
                 if rc != 0:
                     raise RuntimeError(out.strip() or f"yt-dlp failed ({rc})")
 
+            if mode == "gif":
+                mp4_paths = [
+                    path
+                    for path in seen_paths
+                    if path.is_file() and path.suffix.lower() == ".mp4"
+                ]
+                if not mp4_paths:
+                    mp4_paths = [
+                        path
+                        for path in download_dir.glob(
+                            f"* [{download_instance_id}].mp4"
+                        )
+                        if path.is_file()
+                    ]
+                if not mp4_paths:
+                    raise RuntimeError("yt-dlp did not produce an MP4 file to convert")
+
+                mp4_path = max(mp4_paths, key=lambda path: path.stat().st_mtime)
+                gif_path = mp4_path.with_suffix(".gif")
+                final_gif_path = output_dir / gif_path.name
+                conversion_succeeded = False
+                try:
+                    status_cb("Converting MP4 to GIF...")
+                    ffmpeg_kwargs = _subprocess_kwargs_no_window()
+                    ffmpeg_kwargs["stdout"] = subprocess.DEVNULL
+                    ffmpeg_kwargs["stderr"] = subprocess.PIPE
+                    ffmpeg_proc = subprocess.Popen(
+                        [
+                            str(ffmpeg_exe),
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-y",
+                            "-i",
+                            str(mp4_path),
+                            "-filter_complex",
+                            "[0:v]fps=15,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+                            "-loop",
+                            "0",
+                            str(gif_path),
+                        ],
+                        cwd=str(download_dir),
+                        **ffmpeg_kwargs,
+                    )
+                    while ffmpeg_proc.poll() is None:
+                        if cancel_event is not None and cancel_event.is_set():
+                            ffmpeg_proc.terminate()
+                            try:
+                                ffmpeg_proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                ffmpeg_proc.kill()
+                                ffmpeg_proc.wait(timeout=5)
+                            ffmpeg_proc.communicate()
+                            raise _Canceled("Canceled")
+                        time.sleep(0.2)
+
+                    _, ffmpeg_error = ffmpeg_proc.communicate()
+                    if ffmpeg_proc.returncode != 0:
+                        detail = (ffmpeg_error or "").strip()
+                        raise RuntimeError(
+                            detail or f"FFmpeg failed ({ffmpeg_proc.returncode})"
+                        )
+                    if not gif_path.is_file() or gif_path.stat().st_size == 0:
+                        raise RuntimeError("FFmpeg did not produce a GIF file")
+                    shutil.move(str(gif_path), str(final_gif_path))
+                    conversion_succeeded = True
+                    seen_paths.discard(mp4_path)
+                    seen_paths.add(final_gif_path)
+                finally:
+                    mp4_path.unlink(missing_ok=True)
+                    if not conversion_succeeded:
+                        gif_path.unlink(missing_ok=True)
+
         output_paths = sorted(str(path) for path in seen_paths)
         if output_paths:
             _log("INFO", "DOWNLOAD", "Completed", operation_id, file=output_paths[-1])
@@ -2053,6 +2137,9 @@ def _download_with_ytdlp(
         if _minimum_log_level() <= _LOG_LEVELS["DEBUG"]:
             _log("DEBUG", "DOWNLOAD", "Traceback", operation_id, traceback=traceback.format_exc())
         done_cb(str(exc))
+    finally:
+        if gif_temp_dir is not None:
+            gif_temp_dir.cleanup()
 
 
 def run() -> int:
@@ -2378,7 +2465,7 @@ def run_tray(ffmpeg_dir: Optional[str] = None) -> int:
                     f"Application: {APP_VERSION}",
                 )
                 check_flags = win32con.MF_STRING | (win32con.MF_GRAYED if app_checking else 0)
-                check_label = "Checking for application updates..." if app_checking else "Check for application updates"
+                check_label = "Checking for updates..." if app_checking else "Check for updates"
                 win32gui.AppendMenu(settings_menu, check_flags, ID_APP_CHECK, check_label)
                 if app_update is not None:
                     win32gui.AppendMenu(settings_menu, win32con.MF_STRING, ID_APP_UPDATE, _application_update_label(app_update))
@@ -3571,7 +3658,7 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
 
         action_app_version = QtGui.QAction(f"Application: {APP_VERSION}", submenu_settings)
         action_app_version.setEnabled(False)
-        action_check_app_update = QtGui.QAction("Check for application updates", submenu_settings)
+        action_check_app_update = QtGui.QAction("Check for updates", submenu_settings)
         action_install_app_update = QtGui.QAction("", submenu_settings)
         action_install_app_update.setVisible(False)
         submenu_settings.addSeparator()
@@ -3901,7 +3988,7 @@ def run_tray_qt(ffmpeg_dir: Optional[str] = None) -> int:
             action_app_version.setText(f"Application: {APP_VERSION}")
             action_check_app_update.setEnabled(not checking)
             action_check_app_update.setText(
-                "Checking for application updates..." if checking else "Check for application updates"
+                "Checking for updates..." if checking else "Check for updates"
             )
             action_install_app_update.setVisible(info is not None)
             if info is not None:

@@ -331,19 +331,19 @@
   }
 
   /** Requests localhost download. */
-  async function requestLocalhostDownload(url) {
+  async function requestLocalhostDownload(url, mode = "video") {
     try {
       const resp = await chrome.runtime.sendMessage({
         type: "localhostDownload",
         url,
-        mode: "video",
+        mode,
       });
       if (!resp || resp.ok !== true) {
         throw new Error((resp && resp.error) || "download failed");
       }
     } catch (err) {
       // Keep console noise minimal; user can inspect if needed.
-      console.error("ytdlp twitter download failed", err);
+      console.error(`ytdlp twitter ${mode} download failed`, err);
     }
   }
 
@@ -884,14 +884,13 @@
                   : hasVideoInContainer(tweetScopedEl);
 
                 if (videoPresent) {
-                  // X "GIF" posts are typically served as looping MP4s under
-                  // video.twimg.com/tweet_video/... . Download via Chrome so we
-                  // don't involve the app/yt-dlp pipeline.
+                  // X "GIF" posts are served as MP4s; ask the local app to
+                  // convert the video to GIF before saving the result.
                   if (isGifPostFromContainer(tweetScopedEl)) {
                     const vidUrl =
                       getDirectVideoUrlFromContainer(tweetScopedEl);
                     if (vidUrl) {
-                      requestChromeDownload(vidUrl);
+                      requestLocalhostDownload(vidUrl, "gif");
                       return;
                     }
                   }
@@ -1171,4 +1170,3 @@
     void start();
   }
 })();
-

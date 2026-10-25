@@ -9,3 +9,4 @@ ytdlp-onefile.spec
 .github
 /vendor/ffmpeg.exe
 /vendor/ffprobe.exe
+/tests/
